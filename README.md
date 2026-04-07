@@ -4,7 +4,7 @@ This repository accompanies our trajectory-learning framework for globally const
 It releases three paper stages - **Tom-CAT**, **Dep-DOG**, and **Ser-FOX** - together with standard
 masked-diffusion and autoregressive baselines.
 
-**Included manuscript:** [`0main-en.pdf`](0main-en.pdf)
+**Release note:** The manuscript PDF is not included in the current public repository snapshot.
 
 > **Important:** `MDM/` is the released vanilla masked-diffusion baseline.
 > It is **not** the same thing as `Dep-DOG/`.
@@ -18,7 +18,6 @@ masked-diffusion and autoregressive baselines.
 - `Ser-FOX/`: Stage 3 Ser-FOX implementation
 - `MDM/`: standard masked diffusion baseline
 - `AR/`: standard autoregressive baseline
-- `0main-en.pdf`: manuscript PDF
 
 ---
 
@@ -314,6 +313,6 @@ The canonical open-source entrypoints remain the ones listed above.
 
 ## Citation
 
-If you use this repository, please cite the manuscript currently included as
-`0main-en.pdf`. A BibTeX entry will be added once the public paper record is
+If you use this repository, please cite the forthcoming public paper record once
+it is available. A BibTeX entry will be added here when the citation details are
 finalized.
