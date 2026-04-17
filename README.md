@@ -156,6 +156,20 @@ It also includes:
 
 Other paper tasks such as Sudoku, SAT, Countdown, and Cipher are expected to be prepared as JSONL datasets and then packed with the generic preprocessing scripts.
 
+### Additional dataset resources
+
+Datasets for several tasks used in this project can be accessed from this Google Drive package:
+
+- [Google Drive dataset package](https://drive.google.com/file/d/1b0OIlYL76rVVuNYIfIb-L_Ptdg6k_y0c/view?usp=sharing)
+
+For Cipher-related material, please also see:
+
+- [`data/minimal_planning/`](data/minimal_planning/README.md)
+
+For additional Sudoku dataset information, please see:
+
+- [zeyuzhangzyz repositories](https://github.com/zeyuzhangzyz?tab=repositories)
+
 ### Packing rule
 
 The preprocessors use a **character-level vocabulary** and serialize each example as:
@@ -308,6 +322,25 @@ In particular:
 - Some older checkpoints still live under legacy output roots such as `out/MDMx0/...`, `out/AR/...`, or `out/AR2train...`
 
 The canonical open-source entrypoints remain the ones listed above.
+
+---
+
+## Acknowledgments
+
+We gratefully acknowledge the public resources released by
+[HKUNLP/diffusion-vs-ar](https://github.com/HKUNLP/diffusion-vs-ar?tab=readme-ov-file),
+which helped inform related reasoning and planning benchmark work.
+
+Related reference:
+
+```bibtex
+@article{ye2024beyond,
+  title={Beyond Autoregression: Discrete Diffusion for Complex Reasoning and Planning},
+  author={Ye, Jiacheng and Gao, Jiahui and Gong, Shansan and Zheng, Lin and Jiang, Xin and Li, Zhenguo and Kong, Lingpeng},
+  journal={arXiv preprint arXiv:2410.14157},
+  year={2024}
+}
+```
 
 ---
 
