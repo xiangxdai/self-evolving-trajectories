@@ -153,6 +153,7 @@ The repository currently exposes two generic preprocessing entrypoints for fixed
 It also includes:
 
 - `data/minimal_planning/generate_dataset.py`: generator for the minimal planning benchmark
+- `data/cipher/README.md`: cipher-focused dataset generation notes and scripts
 
 Other paper tasks such as Sudoku, SAT, Countdown, and Cipher are expected to be prepared as JSONL datasets and then packed with the generic preprocessing scripts.
 
@@ -162,8 +163,9 @@ Datasets for several tasks used in this project can be accessed from this Google
 
 - [Google Drive dataset package](https://drive.google.com/file/d/1b0OIlYL76rVVuNYIfIb-L_Ptdg6k_y0c/view?usp=sharing)
 
-For Cipher-related material, please also see:
+For Cipher-and-Plain related material, please also see:
 
+- [`data/cipher/`](data/cipher/README.md)
 - [`data/minimal_planning/`](data/minimal_planning/README.md)
 
 For additional Sudoku dataset information, please see:
