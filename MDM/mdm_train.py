@@ -250,6 +250,8 @@ def build_parser():
     parser.add_argument("--suffix", type=str, default=None, help="Suffix appended to the output directory")
     parser.add_argument("--out_dir", type=str, default=None, help="Optional explicit output directory")
     parser.add_argument("--eval_iters", type=int, default=None, help="Number of batches used for periodic evaluation")
+    parser.add_argument("--eval_interval", type=int, default=None, help="Eval every N iters (default: max_iters // 10)")
+    parser.add_argument("--checkpoint_interval", type=int, default=None, help="Save checkpoint every N iters (default: same as eval_interval)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=None, help="Global gradient accumulation steps")
     return parser
 
@@ -356,8 +358,25 @@ def main(argv=None):
             mask_token_id=mask_token_id,
         )
 
-    learning_rate = resolve_learning_rate(args, checkpoint_config, train_batch_size)
-    print(f"Using learning rate = {learning_rate:.6f} for batch size = {train_batch_size}")
+    base_batch_size = 512
+    base_learning_rate = 3e-4
+    if args.learning_rate is not None or args.new_learning_rate is not None:
+        learning_rate = resolve_learning_rate(args, checkpoint_config, train_batch_size)
+        scale_learning_rate = False
+        print(f"Using explicit learning rate = {learning_rate:.6g}")
+    elif (
+        resume_mode
+        and args.batch_size is None
+        and args.new_batch_size is None
+        and args.gradient_accumulation_steps is None
+        and "learning_rate" in checkpoint_config
+    ):
+        learning_rate = checkpoint_config["learning_rate"]
+        scale_learning_rate = False
+        print(f"Using checkpoint learning rate = {learning_rate:.6g}")
+    else:
+        learning_rate = base_learning_rate
+        scale_learning_rate = True
 
     weight_decay = checkpoint_config.get("weight_decay", 1e-1)
     beta1 = checkpoint_config.get("beta1", 0.9)
@@ -369,13 +388,17 @@ def main(argv=None):
     compile_model = args.compile
 
     target_interval_span = additional_iters if resume_mode else max_iters
-    eval_interval = max(1, target_interval_span // 10)
+    eval_interval = args.eval_interval if args.eval_interval is not None else max(1, target_interval_span // 10)
+    checkpoint_interval = args.checkpoint_interval if args.checkpoint_interval is not None else eval_interval
+    if eval_interval < 1:
+        raise ValueError(f"eval_interval must be >= 1, got {eval_interval}")
+    if checkpoint_interval < 1:
+        raise ValueError(f"checkpoint_interval must be >= 1, got {checkpoint_interval}")
     log_interval = max(1, target_interval_span // 100)
     eval_iters = args.eval_iters if args.eval_iters is not None else checkpoint_config.get(
         "eval_iters",
         max(1, min(200, target_interval_span)),
     )
-    always_save_checkpoint = True
     eval_only = False
     wandb_log = False
     wandb_project = profile["wandb_project"]
@@ -414,6 +437,8 @@ def main(argv=None):
         backend=backend,
         compile=compile_model,
         eval_iters=eval_iters,
+        eval_interval=eval_interval,
+        checkpoint_interval=checkpoint_interval,
         out_dir=str(out_dir),
     )
 
@@ -438,6 +463,25 @@ def main(argv=None):
 
     tokens_per_iter = gradient_accumulation_steps * ddp_world_size * train_batch_size * data_size
     print(f"tokens per iteration will be: {tokens_per_iter:,}")
+
+    global_batch_size = train_batch_size * ddp_world_size * gradient_accumulation_steps
+    lr_scaling_factor = global_batch_size / base_batch_size
+    if scale_learning_rate:
+        learning_rate = base_learning_rate * lr_scaling_factor
+        print(
+            f"Using scaled MDM learning rate = {learning_rate:.6g} "
+            f"for global batch size = {global_batch_size}"
+        )
+    min_lr = learning_rate / 10
+    config.update({
+        "base_batch_size": base_batch_size,
+        "base_learning_rate": base_learning_rate,
+        "global_batch_size": global_batch_size,
+        "lr_scaling_factor": lr_scaling_factor,
+        "learning_rate": learning_rate,
+        "min_lr": min_lr,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+    })
 
     if master_process:
         os.makedirs(out_dir, exist_ok=True)
@@ -605,30 +649,35 @@ def main(argv=None):
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        if iter_num % eval_interval == 0:
+        is_eval_step = iter_num % eval_interval == 0
+        is_ckpt_step = iter_num % checkpoint_interval == 0
+        if is_eval_step or is_ckpt_step:
             if ddp:
                 torch.distributed.barrier()
             if master_process:
-                losses = estimate_loss(raw_model)
-                last_val_loss = losses["val"].item()
-                eval_message = f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
-                print(eval_message)
-                logger.info(eval_message)
+                if is_eval_step:
+                    losses = estimate_loss(raw_model)
+                    last_val_loss = losses["val"].item()
+                    eval_message = f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+                    print(eval_message)
+                    logger.info(eval_message)
 
-                if wandb_log:
-                    wandb.log({
-                        "iter": iter_num,
-                        "train/loss": losses["train"],
-                        "val/loss": losses["val"],
-                        "lr": lr,
-                        "mfu": running_mfu * 100,
-                    })
+                    if wandb_log:
+                        wandb.log({
+                            "iter": iter_num,
+                            "train/loss": losses["train"],
+                            "val/loss": losses["val"],
+                            "lr": lr,
+                            "mfu": running_mfu * 100,
+                        })
 
-                save_due_to_improvement = last_val_loss < best_val_loss
-                if save_due_to_improvement:
-                    best_val_loss = last_val_loss
-                if (save_due_to_improvement or always_save_checkpoint) and iter_num > 0:
-                    checkpoint_path = save_checkpoint(iter_num, best_val_loss, last_val_loss)
+                    save_due_to_improvement = last_val_loss < best_val_loss
+                    if save_due_to_improvement:
+                        best_val_loss = last_val_loss
+
+                if is_ckpt_step and iter_num > 0:
+                    current_last_val_loss = last_val_loss if last_val_loss is not None else best_val_loss
+                    checkpoint_path = save_checkpoint(iter_num, best_val_loss, current_last_val_loss)
                     save_message = f"saving checkpoint to {checkpoint_path}"
                     print(save_message)
                     logger.info(save_message)

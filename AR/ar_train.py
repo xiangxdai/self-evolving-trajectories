@@ -57,7 +57,11 @@ def build_parser():
     parser.add_argument("--max_iters", type=int, default=None, help="Total training iterations for scratch mode")
     parser.add_argument("--additional_iters", type=int, default=None, help="Additional iterations for resume mode")
     parser.add_argument("--batch_size", type=int, default=None, help="Training batch size")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=None, help="Global gradient accumulation steps")
     parser.add_argument("--learning_rate", type=float, default=None, help="Optional explicit learning rate override")
+    parser.add_argument("--eval_interval", type=int, default=None, help="Eval every N iters (default: max_iters // 10)")
+    parser.add_argument("--checkpoint_interval", type=int, default=None, help="Save checkpoint every N iters (default: same as eval_interval)")
+    parser.add_argument("--eval_iters", type=int, default=None, help="Number of batches used for periodic evaluation")
     parser.add_argument("--compile", type=parse_bool, default=True, help="Use torch.compile")
     parser.add_argument("--suffix", type=str, default=None, help="Suffix appended to the output directory name")
     parser.add_argument("--out_dir", type=str, default=None, help="Optional explicit output directory")
@@ -287,6 +291,11 @@ def main(argv=None, default_overrides=None):
         else:
             train_batch_size = checkpoint_config.get("train_batch_size", profile["default_batch_size"])
             val_batch_size = checkpoint_config.get("val_batch_size", max(1, train_batch_size // 2))
+        gradient_accumulation_steps = (
+            args.gradient_accumulation_steps
+            if args.gradient_accumulation_steps is not None
+            else checkpoint_config.get("gradient_accumulation_steps", 1)
+        )
     else:
         checkpoint = None
         checkpoint_config = {}
@@ -308,6 +317,7 @@ def main(argv=None, default_overrides=None):
         max_iters = args.max_iters if args.max_iters is not None else profile["default_max_iters"]
         train_batch_size = args.batch_size if args.batch_size is not None else profile["default_batch_size"]
         val_batch_size = max(1, train_batch_size // 2)
+        gradient_accumulation_steps = args.gradient_accumulation_steps if args.gradient_accumulation_steps is not None else 1
 
     data_dir = DATA_ROOT / dataset
 
@@ -375,31 +385,45 @@ def main(argv=None, default_overrides=None):
     base_learning_rate = 3e-4
     if args.learning_rate is not None:
         learning_rate = args.learning_rate
-        print(f"Using explicit learning rate = {learning_rate:.6f}")
-    elif resume_mode and args.batch_size is None and "learning_rate" in checkpoint_config:
+        scale_learning_rate = False
+        print(f"Using explicit learning rate = {learning_rate:.6g}")
+    elif (
+        resume_mode
+        and args.batch_size is None
+        and args.gradient_accumulation_steps is None
+        and "learning_rate" in checkpoint_config
+    ):
         learning_rate = checkpoint_config["learning_rate"]
-        print(f"Using checkpoint learning rate = {learning_rate:.6f}")
+        scale_learning_rate = False
+        print(f"Using checkpoint learning rate = {learning_rate:.6g}")
     else:
-        learning_rate = base_learning_rate * (train_batch_size / base_batch_size)
-        print(f"Using scaled learning rate = {learning_rate:.6f} for batch size = {train_batch_size}")
+        learning_rate = base_learning_rate
+        scale_learning_rate = True
 
     weight_decay = checkpoint_config.get("weight_decay", 1e-1)
     beta1 = checkpoint_config.get("beta1", 0.9)
     beta2 = checkpoint_config.get("beta2", 0.95)
     grad_clip = checkpoint_config.get("grad_clip", 1.0)
     decay_lr = checkpoint_config.get("decay_lr", True)
-    gradient_accumulation_steps = checkpoint_config.get("gradient_accumulation_steps", 1)
     backend = checkpoint_config.get("backend", "nccl")
     dtype = checkpoint_config.get("dtype", "bfloat16")
     compile_model = args.compile
 
     target_interval_span = additional_iters if resume_mode else max_iters
-    eval_interval = max(1, target_interval_span // 10)
+    eval_interval = args.eval_interval if args.eval_interval is not None else max(1, target_interval_span // 10)
+    checkpoint_interval = args.checkpoint_interval if args.checkpoint_interval is not None else eval_interval
+    if eval_interval < 1:
+        raise ValueError(f"eval_interval must be >= 1, got {eval_interval}")
+    if checkpoint_interval < 1:
+        raise ValueError(f"checkpoint_interval must be >= 1, got {checkpoint_interval}")
     log_interval = max(1, target_interval_span // 100)
     # Keep evaluation bounded; using max_iters // 10 here would make long runs
     # spend too much wall-clock time inside evaluation.
-    eval_iters = checkpoint_config.get("eval_iters", max(1, min(200, target_interval_span)))
-    always_save_checkpoint = True
+    eval_iters = (
+        args.eval_iters
+        if args.eval_iters is not None
+        else checkpoint_config.get("eval_iters", max(1, min(200, target_interval_span)))
+    )
     eval_only = False
     wandb_log = False
     wandb_project = profile["wandb_project"]
@@ -438,6 +462,8 @@ def main(argv=None, default_overrides=None):
         backend=backend,
         compile=compile_model,
         eval_iters=eval_iters,
+        eval_interval=eval_interval,
+        checkpoint_interval=checkpoint_interval,
         out_dir=str(out_dir),
     )
 
@@ -465,6 +491,25 @@ def main(argv=None, default_overrides=None):
 
     tokens_per_iter = gradient_accumulation_steps * ddp_world_size * train_batch_size * block_size
     print(f"tokens per iteration will be: {tokens_per_iter:,}")
+
+    global_batch_size = train_batch_size * ddp_world_size * gradient_accumulation_steps
+    lr_scaling_factor = global_batch_size / base_batch_size
+    if scale_learning_rate:
+        learning_rate = base_learning_rate * lr_scaling_factor
+        print(
+            f"Using scaled AR learning rate = {learning_rate:.6g} "
+            f"for global batch size = {global_batch_size}"
+        )
+    min_lr = learning_rate / 10
+    config.update({
+        "base_batch_size": base_batch_size,
+        "base_learning_rate": base_learning_rate,
+        "global_batch_size": global_batch_size,
+        "lr_scaling_factor": lr_scaling_factor,
+        "learning_rate": learning_rate,
+        "min_lr": min_lr,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+    })
 
     if master_process:
         os.makedirs(out_dir, exist_ok=True)
@@ -595,43 +640,47 @@ def main(argv=None, default_overrides=None):
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        if iter_num % eval_interval == 0:
+        is_eval_step = iter_num % eval_interval == 0
+        is_ckpt_step = iter_num % checkpoint_interval == 0
+        if is_eval_step or is_ckpt_step:
             if ddp:
                 torch.distributed.barrier()
             if master_process:
-                losses = estimate_loss(raw_model)
-                eval_message = f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
-                print(eval_message)
-                logger.info(eval_message)
+                if is_eval_step:
+                    losses = estimate_loss(raw_model)
+                    eval_message = f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+                    print(eval_message)
+                    logger.info(eval_message)
 
-                if wandb_log:
-                    wandb.log({
-                        "iter": iter_num,
-                        "train/loss": losses["train"],
-                        "val/loss": losses["val"],
-                        "lr": lr,
-                        "mfu": running_mfu * 100,
-                    })
+                    if wandb_log:
+                        wandb.log({
+                            "iter": iter_num,
+                            "train/loss": losses["train"],
+                            "val/loss": losses["val"],
+                            "lr": lr,
+                            "mfu": running_mfu * 100,
+                        })
 
-                last_val_loss = losses["val"].item()
-                save_due_to_improvement = last_val_loss < best_val_loss
-                if save_due_to_improvement:
-                    best_val_loss = last_val_loss
-                if save_due_to_improvement or always_save_checkpoint:
-                    if iter_num > 0:
-                        checkpoint_to_save = {
-                            "model": raw_model.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "model_args": model_args,
-                            "iter_num": iter_num,
-                            "best_val_loss": best_val_loss,
-                            "last_val_loss": last_val_loss,
-                            "config": config,
-                        }
-                        save_message = f"saving checkpoint to {out_dir}"
-                        print(save_message)
-                        logger.info(save_message)
-                        torch.save(checkpoint_to_save, os.path.join(out_dir, f"{iter_num}_ckpt.pt"))
+                    last_val_loss = losses["val"].item()
+                    save_due_to_improvement = last_val_loss < best_val_loss
+                    if save_due_to_improvement:
+                        best_val_loss = last_val_loss
+
+                if is_ckpt_step and iter_num > 0:
+                    current_last_val_loss = last_val_loss if last_val_loss is not None else best_val_loss
+                    checkpoint_to_save = {
+                        "model": raw_model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "model_args": model_args,
+                        "iter_num": iter_num,
+                        "best_val_loss": best_val_loss,
+                        "last_val_loss": current_last_val_loss,
+                        "config": config,
+                    }
+                    save_message = f"saving checkpoint to {out_dir}"
+                    print(save_message)
+                    logger.info(save_message)
+                    torch.save(checkpoint_to_save, os.path.join(out_dir, f"{iter_num}_ckpt.pt"))
             if ddp:
                 torch.distributed.barrier()
 
