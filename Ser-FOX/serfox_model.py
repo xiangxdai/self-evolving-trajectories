@@ -1018,10 +1018,11 @@ class GPT(nn.Module):
         At each step:
         1) append the full index block
         2) score all unresolved indices in parallel
-        3) choose the best value for every index independently
+        3) pick the value for every index independently: SAMPLE with temperature
+           (temperature>0) or greedy argmax (temperature<=0)
         4) sample/rank the trajectory position using the per-position confidence
-           scores; temperature/top-k apply only to this position selection
-           and commit the best [index, value] pair back to the prefix
+           scores; temperature/top-k now apply to BOTH value and position selection
+           and commit the [index, value] pair back to the prefix
 
         KV-cache fast path (use_cache=True, default): the committed prefix grows
         by exactly one [index, value] pair (2 tokens) per step, so its K/V is
@@ -1055,7 +1056,19 @@ class GPT(nn.Module):
                 decode = self.unused_index_mask(idx)
 
             permanent_probs = F.softmax(index_logits, dim=-1)
-            idx_next = index_logits.argmax(dim=-1)
+            # Value selection: with temperature>0 SAMPLE the value (so PI decoding is
+            # stochastic over BOTH value and position); temperature<=0 falls back to
+            # greedy argmax for deterministic / reproducible (--argmax) decoding.
+            if temperature is not None and temperature > 0:
+                value_logits = index_logits / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(value_logits, min(top_k, value_logits.size(-1)), dim=-1)
+                    value_logits = value_logits.masked_fill(value_logits < v[..., -1:], float('-inf'))
+                value_probs = F.softmax(value_logits, dim=-1)
+                bsz_, k_, vocab_ = value_probs.shape
+                idx_next = torch.multinomial(value_probs.reshape(-1, vocab_), num_samples=1).view(bsz_, k_)
+            else:
+                idx_next = index_logits.argmax(dim=-1)
 
             if verbose:
                 print(idx_next)

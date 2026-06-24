@@ -265,7 +265,7 @@ def generate_batch(model, prompts, cfg, args):
 
     - serialized_ar + norepeat   -> generate_ar_norepeat (used-mask dedup)
     - serialized_ar + ~norepeat  -> model.generate_serialized_ar (plain AR)
-    - confidence_guided          -> model.generate_parallel_index (PI, unchanged)
+    - confidence_guided          -> model.generate_parallel_index (PI; --argmax => deterministic)
 
     Returns a list-of-lists of decoded token ids ([prompt][I_i, y_i]...).
     """
@@ -273,7 +273,7 @@ def generate_batch(model, prompts, cfg, args):
         y = model.generate_parallel_index(
             prompts,
             max_new_tokens=cfg.response_size,
-            temperature=args.temperature,
+            temperature=(0.0 if args.argmax else args.temperature),
             top_k=args.top_k,
         )
         return y.cpu().tolist()

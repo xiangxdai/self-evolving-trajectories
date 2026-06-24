@@ -125,7 +125,7 @@ parser.add_argument('--compile', type=parse_bool, nargs='?', const=True, default
 parser.add_argument('--no_compile', action='store_false', dest='compile', help='Disable torch.compile')
 parser.add_argument('--regen_blocks_per_step', type=int, default=1000, help='Number of base samples processed per trajectory regeneration chunk')
 parser.add_argument('--regen_max_blocks', type=int, default=0, help='If >0, regenerate only this many randomly chosen base samples per round boundary instead of the full set (deterministic per-round subset seeded by iter). Big speedup on large datasets (e.g. 900k-block path/sudoku); training resamples rows from the regenerated pool anyway, so a 200k subset still gives each row ~256 visits per 50k-iter round.')
-parser.add_argument('--regen_position_temperature', type=float, default=0.0, help='FOX regeneration temperature over trajectory positions only; <=0 keeps deterministic argmax ordering')
+parser.add_argument('--regen_position_temperature', type=float, default=0.0, help='FOX regeneration temperature over trajectory positions only; <=0 keeps deterministic argmax ordering. Auto-set to 1.0 (sampling) when --index_loss_mode soft, unless overridden.')
 parser.add_argument('--dataset', type=str, default=None, help='Dataset path relative to data/ (e.g. cd/cd3/k1); default keeps legacy root meta.pkl/base.bin')
 parser.add_argument('--test_file', type=str, default=None, help='Optional test file for eval_interval test loss and per-round exact-match eval (.bin, .jsonl, or .json)')
 parser.add_argument('--init_from', type=str, default='scratch', choices=['scratch', 'resume'], help='Start from scratch or resume from a checkpoint')
@@ -137,8 +137,8 @@ parser.add_argument('--no_regen_kv_cache', action='store_true', help='Disable KV
 parser.add_argument('--first_round_l2r', type=parse_bool, nargs='?', const=True, default=True, help='DEPRECATED / no-op. train_0.bin is now ALWAYS built in L2R base order; use --shuffle_order ALONE to control whether round-1 trains shuffled (true) or as-is L2R (false). Accepted but ignored so existing launch scripts do not break.')
 parser.add_argument('--loss_mode', type=str, default='all', choices=['all', 'value_only'], help='Loss on all serialized tokens (V1) or only value tokens (V2); default: all')
 parser.add_argument('--skip_loss_eval', type=parse_bool, nargs='?', const=True, default=False, help='Skip estimate_loss (train/val/test loss); keeps only AR/PI accuracy eval. Big speedup when soft-index val eval triggers slow online build_soft_index_targets.')
-parser.add_argument('--index_loss_mode', type=str, default='hard', choices=['hard', 'soft'], help="OPTIONAL soft-index toggle. 'hard' (DEFAULT) = standard next-token cross-entropy on index tokens; soft-index is OFF. 'soft' = distribution distillation: from round 2 onward, each regenerated trajectory also yields a soft target over the remaining reveal positions, trained via mixed_soft_index_ar_loss (see serfox_soft_index.py). Round 1 ALWAYS uses hard regardless of this flag. Enable with: --index_loss_mode soft (then tune --soft_index_score_mode / --soft_index_temperature).")
-parser.add_argument('--soft_index_score_mode', type=str, default='p1-p2', choices=['argmax', 'entropy', 'p1-p2', 'logit_margin', 'gt_prob', 'gt_logprob', 'uniform'], help='[only used when --index_loss_mode soft] Score for soft index targets from parallel value distributions; p1-p2 = prob margin (saturates to 1.0 in confident region -> soft target collapses toward uniform), logit_margin = raw-logit top1-top2 (unbounded, preserves full clue>easy>hard order, pair with soft_index_temperature ~5), uniform = 1/k order-invariance prior')
+parser.add_argument('--index_loss_mode', type=str, default='hard', choices=['hard', 'soft'], help="OPTIONAL soft-index toggle. 'hard' (DEFAULT) = standard next-token cross-entropy on index tokens; soft-index is OFF. 'soft' = distribution distillation: from round 2 onward, each regenerated trajectory also yields a soft target over the remaining reveal positions, trained via mixed_soft_index_ar_loss (see serfox_soft_index.py). Round 1 ALWAYS uses hard regardless of this flag. Enable with: --index_loss_mode soft. Enabling soft also auto-sets --soft_index_score_mode=logit_margin and --regen_position_temperature=1.0 (samples the reveal order) unless you override them explicitly.")
+parser.add_argument('--soft_index_score_mode', type=str, default='p1-p2', choices=['argmax', 'entropy', 'p1-p2', 'logit_margin', 'gt_prob', 'gt_logprob', 'uniform'], help='[only used when --index_loss_mode soft; defaults to logit_margin under soft unless overridden] Score for soft index targets from parallel value distributions; p1-p2 = prob margin (saturates to 1.0 in confident region -> soft target collapses toward uniform), logit_margin = raw-logit top1-top2 (unbounded, preserves full clue>easy>hard order, pair with soft_index_temperature ~5), uniform = 1/k order-invariance prior')
 parser.add_argument('--soft_index_temperature', type=float, default=1.0, help='[only used when --index_loss_mode soft] Temperature for soft index target distribution; default 1.0')
 parser.add_argument('--shuffle_order', type=parse_bool, nargs='?', const=True, default=False, help='Randomly permute (index, value) pair order per train sample. FOX round design: ROUND-1 (iter<round_interval) shuffles ALL rows -> model learns ORDER-INVARIANCE -> HIGH PI, and this round-1 model is what generates the round-2 trajectories. ROUND-2+ shuffles ONLY the canonical/L2R mix rows (regen rows are kept in their confident-first easy-to-hard order, NOT shuffled, which is what boosts AR via self-distillation). default: False')
 parser.add_argument('--first_round_only', type=parse_bool, nargs='?', const=True, default=False, help='Stop after round 1 (skip trajectory regeneration); default: False')
@@ -190,6 +190,16 @@ elif args.rounds is not None:
         args.round_interval = inferred_round_interval
     if "max_iters" not in explicit_options:
         args.max_iters = args.round_interval * args.rounds
+
+# When soft-index supervision is enabled, bundle its companion defaults so a bare
+# --index_loss_mode soft yields the full Soft-FOX recipe: regeneration scores the
+# reveal order by logit_margin and SAMPLES it (diverse trajectories). Explicit CLI
+# flags still win, and the default (hard) is untouched so soft-index stays opt-in.
+if args.index_loss_mode == 'soft':
+    if 'soft_index_score_mode' not in explicit_options:
+        args.soft_index_score_mode = 'logit_margin'
+    if 'regen_position_temperature' not in explicit_options:
+        args.regen_position_temperature = 1.0
 
 n_layer = args.n_layer
 n_head = args.n_head
@@ -1302,7 +1312,7 @@ def evaluate_test_split(test_arr, mode="serialized_ar"):
             with torch.no_grad():
                 if mode == "parallel_index":
                     y = eval_model.generate_parallel_index(
-                        x, max_new_tokens=cfg.response_size, temperature=0.01, top_k=None)
+                        x, max_new_tokens=cfg.response_size, temperature=0.0, top_k=None)
                 else:
                     y = eval_model.generate_serialized_ar(
                         x, max_new_tokens=cfg.response_size * 2, temperature=0.01, top_k=None)
