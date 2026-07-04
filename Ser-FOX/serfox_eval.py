@@ -7,9 +7,11 @@ Two decoding interfaces only:
                                  ``--norepeat true`` (DEFAULT, project standard
                                  口径) runs constrained no-repeat decoding that
                                  masks index choices so an index position can
-                                 never be emitted twice. ``--norepeat false``
-                                 falls back to the plain ``generate_serialized_ar``
-                                 path (the model may pick the same index twice).
+                                 never be emitted twice. ``--pad_eos_last true``
+                                 (DEFAULT) also keeps PAD/EOS value tokens until
+                                 all regular target positions are filled.
+                                 ``--pad_eos_last false`` restores the legacy
+                                 no-repeat helper or plain AR path.
 - ``--mode confidence_guided`` : confidence-guided parallel-index decoding (PI),
                                  unchanged — calls ``model.generate_parallel_index``.
 
@@ -260,12 +262,121 @@ def generate_ar_norepeat(model, prompts, cfg, temperature=0.01, mask_value_vocab
 
 
 @torch.inference_mode()
-def generate_batch(model, prompts, cfg, args):
+def generate_serialized_ar_pad_eos_last(
+    model,
+    prompts,
+    gt_responses,
+    cfg,
+    temperature=1.0,
+    top_k=None,
+    no_repeat_index=True,
+    mask_value_vocab=True,
+    argmax=False,
+    pad_id=None,
+    eos_id=None,
+):
+    """Serialized AR decode that emits PAD/EOS only after regular positions."""
+    if prompts.size(0) != gt_responses.size(0):
+        raise ValueError("prompts and gt_responses must have same batch size")
+    if gt_responses.size(1) != cfg.response_size:
+        raise ValueError(
+            f"gt_responses should have response_size={cfg.response_size}, got {gt_responses.size(1)}"
+        )
+
+    total_steps = cfg.response_size * 2
+    if total_steps == 0:
+        return prompts
+
+    can_cache = prompts.size(1) + total_steps <= cfg.block_size
+    if can_cache:
+        hidden, kv_cache = model.prefill_kv_cache(prompts)
+        next_logits = model.lm_head(hidden[:, -1, :])
+    else:
+        kv_cache = None
+        next_logits = None
+
+    idx = prompts
+    seen = torch.zeros((idx.size(0), cfg.response_size), dtype=torch.bool, device=prompts.device)
+    current_pos = None
+    special_value = torch.zeros_like(gt_responses, dtype=torch.bool, device=gt_responses.device)
+    if pad_id is not None:
+        special_value = special_value | (gt_responses == pad_id)
+    if eos_id is not None:
+        special_value = special_value | (gt_responses == eos_id)
+
+    for step in range(total_steps):
+        if kv_cache is None:
+            idx_cond = idx if idx.size(1) <= cfg.block_size else idx[:, -cfg.block_size:]
+            next_logits = model.forward_ar(idx_cond)[0][:, -1, :]
+
+        logits = next_logits.float() / temperature
+        is_index_step = step % 2 == 0
+
+        if is_index_step:
+            index_mask = torch.zeros_like(logits, dtype=torch.bool)
+            index_token_ids = torch.arange(
+                cfg.index_token_start,
+                cfg.index_token_start + cfg.response_size,
+                device=logits.device,
+            )
+            index_mask[:, index_token_ids] = True
+            logits = logits.masked_fill(~index_mask, -float("inf"))
+            if no_repeat_index:
+                logits[:, cfg.index_token_start : cfg.index_token_start + cfg.response_size] = logits[
+                    :, cfg.index_token_start : cfg.index_token_start + cfg.response_size
+                ].masked_fill(seen, -float("inf"))
+        else:
+            mask_special_rows = torch.ones(idx.size(0), dtype=torch.bool, device=logits.device)
+            if current_pos is not None:
+                valid_current = (current_pos >= 0) & (current_pos < cfg.response_size)
+                current_special = torch.zeros(idx.size(0), dtype=torch.bool, device=logits.device)
+                if valid_current.any():
+                    row_ids = torch.arange(idx.size(0), device=idx.device)[valid_current]
+                    current_special[valid_current] = special_value[row_ids, current_pos[valid_current]]
+                regular_remaining = ((~seen) & (~special_value)).any(dim=1)
+                allow_special = current_special & (~regular_remaining)
+                mask_special_rows = ~allow_special
+            if mask_special_rows.any():
+                if pad_id is not None:
+                    logits[mask_special_rows, pad_id] = -float("inf")
+                if eos_id is not None:
+                    logits[mask_special_rows, eos_id] = -float("inf")
+            if mask_value_vocab:
+                logits[:, cfg.index_token_start:] = -float("inf")
+
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits = logits.masked_fill(logits < v[:, [-1]], -float("inf"))
+
+        if argmax:
+            idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+        else:
+            probs = torch.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat([idx, idx_next], dim=1)
+
+        if is_index_step:
+            pos = idx_next.squeeze(1) - cfg.index_token_start
+            current_pos = pos
+            valid = (pos >= 0) & (pos < cfg.response_size)
+            if valid.any():
+                row_ids = torch.arange(idx.size(0), device=idx.device)[valid]
+                seen[row_ids, pos[valid]] = True
+
+        if kv_cache is not None:
+            hidden, kv_cache = model.append_to_kv_cache(kv_cache, idx_next, return_hidden=True)
+            next_logits = model.lm_head(hidden[:, -1, :])
+
+    return idx
+
+
+@torch.inference_mode()
+def generate_batch(model, prompts, gt_responses, cfg, args, pad_id=None, eos_id=None):
     """Dispatch a batch of prompts to the requested decoder.
 
-    - serialized_ar + norepeat   -> generate_ar_norepeat (used-mask dedup)
-    - serialized_ar + ~norepeat  -> model.generate_serialized_ar (plain AR)
-    - confidence_guided          -> model.generate_parallel_index (PI; --argmax => deterministic)
+    - serialized_ar + pad_eos_last -> constrained AR with PAD/EOS-last value slots
+    - serialized_ar legacy         -> no-repeat helper or plain model.generate_serialized_ar
+    - confidence_guided             -> model.generate_parallel_index
 
     Returns a list-of-lists of decoded token ids ([prompt][I_i, y_i]...).
     """
@@ -279,6 +390,22 @@ def generate_batch(model, prompts, cfg, args):
         return y.cpu().tolist()
 
     # serialized_ar
+    if args.pad_eos_last:
+        y = generate_serialized_ar_pad_eos_last(
+            model,
+            prompts,
+            gt_responses,
+            cfg,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            no_repeat_index=args.norepeat,
+            mask_value_vocab=not args.value_full_vocab,
+            argmax=args.argmax,
+            pad_id=pad_id,
+            eos_id=eos_id,
+        )
+        return y.cpu().tolist()
+
     if args.norepeat:
         y = generate_ar_norepeat(
             model,
@@ -303,7 +430,7 @@ def generate_batch(model, prompts, cfg, args):
 
 
 @torch.inference_mode()
-def evaluate(model, test_arr, cfg, info, args):
+def evaluate(model, test_arr, cfg, info, args, pad_id=None, eos_id=None):
     rows = np.asarray(test_arr, dtype=np.uint16).reshape(-1, cfg.base_seq_len)
     if args.limit:
         rows = rows[: args.limit]
@@ -319,7 +446,12 @@ def evaluate(model, test_arr, cfg, info, args):
         batch_indices = indices[start : start + args.batch_size]
         batch_rows = rows[batch_indices]
         prompts = torch.tensor(batch_rows[:, : cfg.quiz_size].astype(np.int64), dtype=torch.long, device=device)
-        pred = generate_batch(model, prompts, cfg, args)
+        gt_responses = torch.tensor(
+            batch_rows[:, cfg.quiz_size : cfg.quiz_size + cfg.response_size].astype(np.int64),
+            dtype=torch.long,
+            device=device,
+        )
+        pred = generate_batch(model, prompts, gt_responses, cfg, args, pad_id=pad_id, eos_id=eos_id)
         for local_j, raw_pred in enumerate(pred):
             target = batch_rows[local_j].astype(np.int64).tolist()
             prompt = target[: cfg.quiz_size]
@@ -380,7 +512,16 @@ def build_parser():
         const=True,
         default=True,
         help="serialized_ar only: used-mask index dedup (project standard 口径). "
-        "Default true. --norepeat false runs plain generate_serialized_ar.",
+        "Default true. With --pad_eos_last true, --norepeat false disables only index dedup.",
+    )
+    parser.add_argument(
+        "--pad_eos_last",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="serialized_ar only: keep PAD/EOS value tokens until all regular target positions are filled. "
+        "Default true. Set false to use the legacy AR decode path.",
     )
     parser.add_argument("--meta")
     parser.add_argument("--test_file")
@@ -397,7 +538,7 @@ def build_parser():
     parser.add_argument(
         "--value_full_vocab",
         action="store_true",
-        help="serialized_ar + norepeat: do not restrict value slots to the value vocab.",
+        help="serialized_ar: do not restrict value slots to the value vocab.",
     )
     return parser
 
@@ -429,6 +570,7 @@ def main():
                     "checkpoint",
                     "mode",
                     "norepeat",
+                    "pad_eos_last",
                     "temperature",
                     "argmax",
                     "value_full_vocab",
@@ -450,13 +592,20 @@ def main():
             test_key = (test_path, cfg.quiz_size, cfg.response_size)
             if test_key not in test_cache:
                 test_cache[test_key] = load_test_array(test_path, meta_cache[meta_path], cfg)
+            meta = meta_cache[meta_path]
+            pad_id = meta.get("stoi", {}).get(meta.get("pad_token", "<PAD>"))
+            eos_id = meta.get("stoi", {}).get(meta.get("eos_token", "<EOS>"))
 
-            log(f"Evaluating {it} ({args.mode}, norepeat={args.norepeat}) on rank {info['rank']} world {info['world_size']}", info)
+            log(
+                f"Evaluating {it} ({args.mode}, norepeat={args.norepeat}, "
+                f"pad_eos_last={args.pad_eos_last}) on rank {info['rank']} world {info['world_size']}",
+                info,
+            )
             if args.dtype == "float32":
-                metrics = evaluate(model, test_cache[test_key], cfg, info, args)
+                metrics = evaluate(model, test_cache[test_key], cfg, info, args, pad_id=pad_id, eos_id=eos_id)
             else:
                 with torch.amp.autocast("cuda", dtype=dtype):
-                    metrics = evaluate(model, test_cache[test_key], cfg, info, args)
+                    metrics = evaluate(model, test_cache[test_key], cfg, info, args, pad_id=pad_id, eos_id=eos_id)
 
             if info["rank"] == 0:
                 row = [
@@ -469,6 +618,7 @@ def main():
                     str(ckpt),
                     args.mode,
                     int(args.norepeat),
+                    int(args.pad_eos_last),
                     args.temperature,
                     int(args.argmax),
                     int(args.value_full_vocab),
@@ -477,6 +627,7 @@ def main():
                     csv.writer(f).writerow(row)
                 print(
                     f"iter {it}: {args.mode}{'(norepeat)' if args.norepeat and args.mode == 'serialized_ar' else ''} "
+                    f"pad_eos_last={int(args.pad_eos_last)} "
                     f"{metrics['accuracy']:.6f} ({metrics['correct']}/{metrics['total']}), "
                     f"malformed {metrics['malformed']}",
                     flush=True,

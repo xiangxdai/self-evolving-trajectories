@@ -34,13 +34,16 @@ def soft_index_distribution_from_value_logits(
         eligible_mask: Bool tensor [B, K] for unresolved candidates.
         score_mode: One of top1_prob, margin, logit_margin, neg_entropy, gt_prob,
             gt_logprob, uniform. See the body for exact definitions. logit_margin
-            (raw top1-top2 of the value logits) is the recommended easy-to-hard prior;
-            uniform is an order-invariant prior over the remaining positions.
+            uses the ground-truth value logit minus the best non-ground-truth
+            logit and is the recommended easy-to-hard prior; uniform is an
+            order-invariant prior over the remaining positions.
         temperature: Softmax temperature applied to candidate scores.
-        gt_values: Optional [B, K] ground-truth value token ids for gt_* modes.
+        gt_values: Optional [B, K] ground-truth value token ids for gt_* and
+            logit_margin modes.
     """
-    probs = F.softmax(value_logits.float(), dim=-1)
-    log_probs = F.log_softmax(value_logits.float(), dim=-1)
+    if score_mode in ("top1_prob", "margin", "neg_entropy", "gt_prob", "gt_logprob"):
+        probs = F.softmax(value_logits.float(), dim=-1)
+        log_probs = F.log_softmax(value_logits.float(), dim=-1)
 
     if score_mode == "top1_prob":
         scores = probs.max(dim=-1).values
@@ -51,18 +54,23 @@ def soft_index_distribution_from_value_logits(
         else:
             scores = top2[..., 0] - top2[..., 1]
     elif score_mode == "logit_margin":
-        # top1 - top2 of the RAW logits (NOT softmaxed). prob-margin saturates to 1.0 in
-        # the confident region (clue + easy-to-propagate cells), collapsing the 2nd softmax
-        # over positions into a near-uniform soft target (empirically entropy 4.34 vs
-        # uniform 4.41 on sudoku). logit-margin is unbounded, so it preserves the full
-        # clue>easy>hard gradient. It is very peaked at T=1 (exp blows up big margins) ->
-        # pair with a larger soft_index_temperature (~5) so the top few positions all get
-        # meaningful mass instead of the single largest taking everything.
-        top2 = value_logits.float().topk(k=min(2, value_logits.size(-1)), dim=-1).values
-        if top2.size(-1) == 1:
-            scores = top2[..., 0]
+        if gt_values is None:
+            raise ValueError(f"gt_values is required for score_mode={score_mode!r}")
+        # Ground truth is available when building soft-index targets. Score each
+        # position by how far the correct value logit is above the strongest
+        # incorrect value logit; plain top1-top2 can reward wrong-but-confident
+        # predictions.
+        value_logits_f = value_logits.float()
+        gt_logits = value_logits_f.gather(dim=-1, index=gt_values.unsqueeze(-1)).squeeze(-1)
+        top2 = value_logits_f.topk(k=min(2, value_logits_f.size(-1)), dim=-1)
+        if top2.values.size(-1) == 1:
+            scores = gt_logits
         else:
-            scores = top2[..., 0] - top2[..., 1]
+            top1_values = top2.values[..., 0]
+            top2_values = top2.values[..., 1]
+            top1_is_gt = top2.indices[..., 0].eq(gt_values)
+            best_other_logits = torch.where(top1_is_gt, top2_values, top1_values)
+            scores = gt_logits - best_other_logits
     elif score_mode == "neg_entropy":
         scores = (probs * log_probs).sum(dim=-1)
     elif score_mode in {"gt_prob", "gt_logprob"}:
