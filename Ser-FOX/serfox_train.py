@@ -1104,6 +1104,25 @@ checkpoint = None # free up memory
 # multiple input lengths; static specialization is stable on PyTorch 2.0.
 if compile_parallel_tail and not compile_ddp_optimizer:
     torch_dynamo.config.optimize_ddp = False
+if compile and parallel_tail_weight > 0 and compile_parallel_tail:
+    # Static T->0 specialization intentionally creates one graph per possible
+    # random prefix length. PyTorch defaults to eight cached graphs on some
+    # runtimes, which silently falls back to eager for longer tasks.
+    required_tail_graphs = response_size + 2
+    torch_dynamo.config.cache_size_limit = max(
+        int(torch_dynamo.config.cache_size_limit),
+        required_tail_graphs,
+    )
+    if hasattr(torch_dynamo.config, "accumulated_cache_size_limit"):
+        torch_dynamo.config.accumulated_cache_size_limit = max(
+            int(torch_dynamo.config.accumulated_cache_size_limit),
+            required_tail_graphs * 2,
+        )
+    print(
+        "TorchDynamo tail cache limits: "
+        f"per-function={torch_dynamo.config.cache_size_limit}, "
+        f"required={required_tail_graphs}"
+    )
 if compile and serialized_ar_weight > 0:
     print("compiling fixed-shape serialized-AR forward...")
     model.enable_training_compile()
