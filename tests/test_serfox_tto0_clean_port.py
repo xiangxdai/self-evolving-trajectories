@@ -2,6 +2,7 @@ import sys
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from types import MethodType
 
 import torch
 from torch.nn import functional as F
@@ -130,6 +131,25 @@ class OrderingAndVariantTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(eligible, torch.tensor([[True, False, True, False, True]])))
 
+    def test_pad_eos_last_releases_specials_only_after_regular_values(self):
+        values = torch.tensor([[1, 9, 2, 10]])
+        first = build_torch_remaining_eligible_mask(
+            torch.tensor([[True, True, True, True]]),
+            values,
+            special_policy="exclude_special",
+            eos_id=9,
+            pad_id=10,
+        )
+        last = build_torch_remaining_eligible_mask(
+            torch.tensor([[False, True, False, True]]),
+            values,
+            special_policy="exclude_special",
+            eos_id=9,
+            pad_id=10,
+        )
+        self.assertTrue(torch.equal(first, torch.tensor([[True, False, True, False]])))
+        self.assertTrue(torch.equal(last, torch.tensor([[False, True, False, True]])))
+
     def test_siwei_soft_is_pure_tto0(self):
         args = Namespace(
             training_variant="siwei_soft",
@@ -184,6 +204,46 @@ class ModelBoundaryTests(unittest.TestCase):
                 (1, batch.num_tail + 1, cfg.vocab_size),
             )
             self.assertTrue(torch.isfinite(logits).all())
+
+    def test_pi_uses_predicted_values_to_keep_pad_eos_last(self):
+        cfg = tiny_config()
+        model = GPT(cfg)
+
+        def fixed_scores(_model, idx, num_indices):
+            logits = torch.zeros(
+                idx.size(0),
+                num_indices,
+                cfg.vocab_size,
+                device=idx.device,
+            )
+            preferred_values = (10, 3, 9, 4)
+            confidence_logits = (20.0, 12.0, 18.0, 10.0)
+            for pos, (value, confidence) in enumerate(
+                zip(preferred_values, confidence_logits)
+            ):
+                logits[:, pos, value] = confidence
+            return logits
+
+        model.score_parallel_indices = MethodType(fixed_scores, model)
+        decoded = model.generate_parallel_index(
+            torch.tensor([[1, 2]]),
+            max_new_tokens=cfg.response_size,
+            temperature=0.0,
+            use_cache=False,
+            pad_id=10,
+            eos_id=9,
+            pad_eos_last=True,
+        )
+        pair_indices = decoded[:, cfg.quiz_size :: 2]
+        expected = torch.tensor(
+            [[
+                cfg.index_token_start + 1,
+                cfg.index_token_start + 3,
+                cfg.index_token_start + 0,
+                cfg.index_token_start + 2,
+            ]]
+        )
+        self.assertTrue(torch.equal(pair_indices, expected))
 
 
 if __name__ == "__main__":

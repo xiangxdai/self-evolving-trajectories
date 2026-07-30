@@ -717,13 +717,16 @@ def _sample_online_regen_batch(count):
             else:
                 index_logits = scoring_model.score_parallel_indices_cached(index_tokens, kv_cache)
         probs = F.softmax(index_logits.float(), dim=-1)
-        decode = scoring_model.unused_index_mask(z_basic)
+        decode = build_torch_remaining_eligible_mask(
+            scoring_model.unused_index_mask(z_basic),
+            z_result,
+            special_policy="exclude_special",
+            eos_id=eos_id,
+            pad_id=pad_id,
+        )
         p = probs.gather(dim=2, index=z_result.unsqueeze(-1)).squeeze(-1)
 
-        special_value = torch.zeros_like(decode, dtype=torch.bool)
-        regular_decode = decode & ~special_value
-        sample_decode = torch.where(regular_decode.any(dim=1, keepdim=True), regular_decode, decode)
-        scores = p.float().masked_fill(~sample_decode, -float('inf'))
+        scores = p.float().masked_fill(~decode, -float('inf'))
         if online_regen_method == 'gaussian':
             noisy_scores = scores + torch.randn_like(scores) * online_regen_noise_std
             max_idx = noisy_scores.argmax(dim=1)
@@ -1830,7 +1833,13 @@ def regenerate_trajectory_data(start_block=None, end_block=None, override_model=
                     else:
                         index_logits = scoring_model.score_parallel_indices_cached(index_tokens, kv_cache)
 
-                decode = scoring_model.unused_index_mask(z_basic)
+                decode = build_torch_remaining_eligible_mask(
+                    scoring_model.unused_index_mask(z_basic),
+                    z_result,
+                    special_policy="exclude_special",
+                    eos_id=eos_id,
+                    pad_id=pad_id,
+                )
 
                 # Single distribution P = softmax(logit_margin) over the remaining
                 # positions. The SAME P is used both as the soft index LABEL and as the

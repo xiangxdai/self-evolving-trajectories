@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from serfox_ordering import build_torch_remaining_eligible_mask
+
 
 import os
 
@@ -1113,7 +1115,18 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate_parallel_index(self, idx, max_new_tokens, temperature=1.0, top_k=None, verbose=False, use_cache=True):
+    def generate_parallel_index(
+        self,
+        idx,
+        max_new_tokens,
+        temperature=1.0,
+        top_k=None,
+        verbose=False,
+        use_cache=True,
+        pad_id=None,
+        eos_id=None,
+        pad_eos_last=True,
+    ):
         """
         Mode 2: confidence-guided parallel-index decoding.
 
@@ -1122,7 +1135,9 @@ class GPT(nn.Module):
         2) score all unresolved indices in parallel
         3) pick the value for every index independently: SAMPLE with temperature
            (temperature>0) or greedy argmax (temperature<=0)
-        4) sample/rank the trajectory position using the per-position confidence
+        4) while regular predicted values remain, defer candidates whose predicted
+           value is PAD/EOS
+        5) sample/rank the trajectory position using the per-position confidence
            scores; temperature/top-k now apply to BOTH value and position selection
            and commit the [index, value] pair back to the prefix
 
@@ -1171,6 +1186,15 @@ class GPT(nn.Module):
                 idx_next = torch.multinomial(value_probs.reshape(-1, vocab_), num_samples=1).view(bsz_, k_)
             else:
                 idx_next = index_logits.argmax(dim=-1)
+
+            if pad_eos_last and (pad_id is not None or eos_id is not None):
+                decode = build_torch_remaining_eligible_mask(
+                    decode,
+                    idx_next,
+                    special_policy="exclude_special",
+                    eos_id=eos_id,
+                    pad_id=pad_id,
+                )
 
             if verbose:
                 print(idx_next)

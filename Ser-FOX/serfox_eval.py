@@ -386,6 +386,9 @@ def generate_batch(model, prompts, gt_responses, cfg, args, pad_id=None, eos_id=
             max_new_tokens=cfg.response_size,
             temperature=(0.0 if args.argmax else args.temperature),
             top_k=args.top_k,
+            pad_id=pad_id,
+            eos_id=eos_id,
+            pad_eos_last=args.pad_eos_last,
         )
         return y.cpu().tolist()
 
