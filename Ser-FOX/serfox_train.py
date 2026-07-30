@@ -44,12 +44,14 @@ import pickle
 import json
 from contextlib import nullcontext
 import argparse
+import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
 
 
 import numpy as np
 import torch
+import torch._dynamo as torch_dynamo
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -58,6 +60,13 @@ from serfox_soft_index import (
     mixed_soft_index_ar_loss,
     soft_index_distribution_from_value_logits,
 )
+from serfox_objectives import build_parallel_tail_batch, parallel_tail_loss
+from serfox_ordering import (
+    SHUFFLE_SPECIAL_POLICIES,
+    build_torch_pair_permutation,
+    build_torch_remaining_eligible_mask,
+)
+from serfox_variants import apply_training_variant
 from logger import get_logger
 from torch.nn import functional as F
 
@@ -116,16 +125,19 @@ parser.add_argument('--max_iters', type=int, default=500000, help='Number of Ite
 parser.add_argument('--train_batch_size', type=int, default=256, help='Training micro-batch size')
 parser.add_argument('--eval_batch_size', type=int, default=256, help='Batch size for train/val/test loss evaluation')
 parser.add_argument('--eval_decode_batch_size', type=int, default=256, help='Batch size for AR/PI accuracy decode eval. Decode is per-sample independent, so batching does not change results, only speed (the old per-sample loop is ~B times slower). Set 1 for the legacy per-sample path.')
-parser.add_argument('--gradient_accumulation_steps', type=int, default=4, help='Global gradient accumulation steps')
+parser.add_argument('--gradient_accumulation_steps', type=int, default=2, help='Global gradient accumulation steps. With the default micro-batch 256 this keeps effective global batch 512 on one or two ranks.')
 parser.add_argument('--round_interval', type=int, default=None, help='Round length for LR schedule and trajectory regeneration; default is max_iters // 10')
 parser.add_argument('--eval_interval', type=int, default=None, help='Estimate train/val/test losses every N iterations; default is 500')
 parser.add_argument('--checkpoint_interval', type=int, default=5000, help='Save checkpoints and run test accuracy every N iterations; default is 5000')
 parser.add_argument('--eval_iters', type=int, default=None, help='Number of batches used to estimate train/val/test loss')
 parser.add_argument('--compile', type=parse_bool, nargs='?', const=True, default=True, help='Use torch.compile for the training forward path')
 parser.add_argument('--no_compile', action='store_false', dest='compile', help='Disable torch.compile')
+parser.add_argument('--compile_parallel_tail', type=parse_bool, nargs='?', const=True, default=True, help='Compile the Siwei/T->0 parallel-tail scorer. default: True')
+parser.add_argument('--compile_parallel_tail_dynamic', type=parse_bool, nargs='?', const=True, default=False, help='Use one symbolic dynamic-shape tail graph. Keep False on PyTorch 2.0; static specialization is the compatible default.')
+parser.add_argument('--compile_ddp_optimizer', type=parse_bool, nargs='?', const=True, default=False, help='Keep TorchDynamo DDPOptimizer enabled for compiled tails. Disabled by default for PyTorch 2.0 compatibility.')
 parser.add_argument('--regen_blocks_per_step', type=int, default=1000, help='Number of base samples processed per trajectory regeneration chunk')
 parser.add_argument('--regen_max_blocks', type=int, default=0, help='If >0, regenerate only this many randomly chosen base samples per round boundary instead of the full set (deterministic per-round subset seeded by iter). Big speedup on large datasets (e.g. 900k-block path/sudoku); training resamples rows from the regenerated pool anyway, so a 200k subset still gives each row ~256 visits per 50k-iter round.')
-parser.add_argument('--regen_position_temperature', type=float, default=0.0, help='FOX regeneration temperature over trajectory positions only; <=0 keeps deterministic argmax ordering. Auto-set to 1.0 (sampling) when --index_loss_mode soft, unless overridden.')
+parser.add_argument('--regen_position_temperature', type=float, default=0.0, help='FOX regeneration temperature over trajectory positions only; <=0 keeps deterministic argmax ordering. default: 0')
 parser.add_argument('--dataset', type=str, default=None, help='Dataset path relative to data/ (e.g. cd/cd3/k1); default keeps legacy root meta.pkl/base.bin')
 parser.add_argument('--test_file', type=str, default=None, help='Optional test file for eval_interval test loss and per-round exact-match eval (.bin, .jsonl, or .json)')
 parser.add_argument('--init_from', type=str, default='scratch', choices=['scratch', 'resume'], help='Start from scratch or resume from a checkpoint')
@@ -138,9 +150,14 @@ parser.add_argument('--first_round_l2r', type=parse_bool, nargs='?', const=True,
 parser.add_argument('--loss_mode', type=str, default='all', choices=['all', 'value_only'], help='Loss on all serialized tokens (V1) or only value tokens (V2); default: all')
 parser.add_argument('--skip_loss_eval', type=parse_bool, nargs='?', const=True, default=False, help='Skip estimate_loss (train/val/test loss); keeps only AR/PI accuracy eval. Big speedup when soft-index val eval triggers slow online build_soft_index_targets.')
 parser.add_argument('--index_loss_mode', type=str, default='hard', choices=['hard', 'soft'], help="OPTIONAL soft-index toggle. 'hard' (DEFAULT) uses hard next-index CE. 'soft' distills the regenerated constrained next-index distribution.")
+parser.add_argument('--training_variant', type=str, default=None, choices=['basic', 'soft', 'siwei', 'siwei_soft', 'hard', 'siwei-soft', 'siwei_tto0'], help='Objective preset. With no explicit low-level loss flags, the final siwei_soft T->0 recipe is selected. basic/soft retain serialized AR for compatibility.')
 parser.add_argument('--soft_index_score_mode', type=str, default='p1-p2', choices=['argmax', 'entropy', 'p1-p2', 'logit_margin', 'gt_prob', 'gt_logprob', 'uniform'], help='Score for soft index targets; logit_margin is the ground-truth value logit minus the best non-ground-truth value logit.')
 parser.add_argument('--soft_index_temperature', type=float, default=1.0, help='Temperature for soft index target distribution.')
 parser.add_argument('--shuffle_order', type=parse_bool, nargs='?', const=True, default=True, help='Randomly permute (index, value) pairs. Round 1 shuffles all rows; round 2+ shuffles canonical rows only. default: True')
+parser.add_argument('--shuffle_special_policy', type=str, default='exclude_special', choices=SHUFFLE_SPECIAL_POLICIES, help='Train-time pair shuffle policy. exclude_special keeps PAD/EOS positions after regular positions. default: exclude_special')
+parser.add_argument('--round1_index_target', type=str, default='uniform', choices=['hard', 'uniform'], help='Round-1 soft index supervision. uniform matches the shuffled T->0 set objective. default: uniform')
+parser.add_argument('--serialized_ar_weight', type=float, default=0.0, help='Weight for full serialized AR loss. Final T->0 uses 0. default: 0')
+parser.add_argument('--parallel_tail_weight', type=float, default=1.0, help='Weight for the T->0 random-prefix next-index + remaining-values objective. default: 1')
 parser.add_argument('--first_round_only', type=parse_bool, nargs='?', const=True, default=False, help='Stop after round 1 (skip trajectory regeneration); default: False')
 parser.add_argument('--warm_from_best_round', type=parse_bool, nargs='?', const=True, default=False, help='At each round boundary, reload the highest-AR checkpoint of the just-finished round (overfit guard: stop scanning after 2 consecutive AR drops) before regen+continue, instead of warm-starting from the last ckpt; default: False')
 parser.add_argument('--mix_ratios', type=str, default='1.0,0.0,0.0', help='Sampling ratios for [Main, Prev, Canonical] in round 2+; 1.0,0.0,0.0 = pure regen (default), 0.7,0.2,0.1 = warm+mix')
@@ -191,15 +208,24 @@ elif args.rounds is not None:
     if "max_iters" not in explicit_options:
         args.max_iters = args.round_interval * args.rounds
 
+_variant_fields = {
+    "index_loss_mode",
+    "round1_index_target",
+    "serialized_ar_weight",
+    "parallel_tail_weight",
+}
+if args.training_variant is None and not (_variant_fields & explicit_options):
+    args.training_variant = "siwei_soft"
+training_variant = apply_training_variant(args, explicit_options)
+
 # When soft-index supervision is enabled, bundle its companion defaults so a bare
-# --index_loss_mode soft yields the full Soft-FOX recipe: regeneration scores the
-# reveal order by logit_margin and SAMPLES it (diverse trajectories). Explicit CLI
-# flags still win, and the default (hard) is untouched so soft-index stays opt-in.
+# Soft FOX uses value-margin distributions as supervision. Regeneration remains
+# deterministic argmax (temperature 0) unless the caller explicitly requests
+# sampling, so saved trajectories and labels come from the same constrained
+# distribution without adding an implicit temperature change.
 if args.index_loss_mode == 'soft':
     if 'soft_index_score_mode' not in explicit_options:
         args.soft_index_score_mode = 'logit_margin'
-    if 'regen_position_temperature' not in explicit_options:
-        args.regen_position_temperature = 1.0
 
 n_layer = args.n_layer
 n_head = args.n_head
@@ -226,12 +252,25 @@ online_regen_sample = args.online_regen_sample
 online_regen_method = args.online_regen_method
 online_regen_temperature = args.online_regen_temperature
 online_regen_noise_std = args.online_regen_noise_std
+shuffle_special_policy = args.shuffle_special_policy
+round1_index_target = args.round1_index_target
+serialized_ar_weight = args.serialized_ar_weight
+parallel_tail_weight = args.parallel_tail_weight
+compile_parallel_tail = args.compile_parallel_tail
+compile_parallel_tail_dynamic = args.compile_parallel_tail_dynamic
+compile_ddp_optimizer = args.compile_ddp_optimizer
 if soft_index_temperature <= 0:
     raise ValueError(f'--soft_index_temperature must be > 0, got {soft_index_temperature}')
 if online_regen_temperature <= 0:
     raise ValueError(f'--online_regen_temperature must be > 0, got {online_regen_temperature}')
 if online_regen_noise_std < 0:
     raise ValueError(f'--online_regen_noise_std must be >= 0, got {online_regen_noise_std}')
+if serialized_ar_weight < 0 or parallel_tail_weight < 0:
+    raise ValueError("loss weights must be non-negative")
+if serialized_ar_weight == 0 and parallel_tail_weight == 0:
+    raise ValueError("at least one training loss must be enabled")
+if parallel_tail_weight > 0 and compile_parallel_tail and not args.compile:
+    raise ValueError("--compile_parallel_tail requires --compile true")
 mix_ratios = [float(x) for x in args.mix_ratios.split(',')]
 if len(mix_ratios) != 3:
     raise ValueError(f"--mix_ratios must have exactly 3 values [Main, Prev, Canonical], got {len(mix_ratios)}")
@@ -310,13 +349,14 @@ if shuffle_order:
 else:
     shuf_tag = "fix"
 idx_loss_tag = "" if index_loss_mode == "hard" else f"_softidx_{soft_index_score_mode.replace('-', '')}"
+variant_tag = f"_{training_variant}" if training_variant != "custom" else ""
 if dataset is None:
     config_name = f'{n_layer}_{n_head}_{n_embd}'
 else:
     safe_dataset = dataset.replace("/", "_").replace("\\", "_")
     config_name = f'{safe_dataset}_{n_layer}_{n_head}_{n_embd}'
 
-base_run_name = f'{config_name}_{loss_tag}_{shuf_tag}{idx_loss_tag}_{seed}'
+base_run_name = f'{config_name}_{loss_tag}_{shuf_tag}{variant_tag}{idx_loss_tag}_{seed}'
 if explicit_out_dir is not None:
     out_dir_path = Path(explicit_out_dir).expanduser()
     if not out_dir_path.is_absolute():
@@ -465,8 +505,13 @@ print(
     f"round interval {round_interval}, eval interval {eval_interval}, "
     f"checkpoint interval {checkpoint_interval}, "
     f"loss_mode={loss_mode}, index_loss_mode={index_loss_mode}, "
+    f"training_variant={training_variant}, round1_index_target={round1_index_target}, "
+    f"serialized_ar_weight={serialized_ar_weight}, parallel_tail_weight={parallel_tail_weight}, "
     f"soft_index_score_mode={soft_index_score_mode}, soft_index_temperature={soft_index_temperature}, "
-    f"shuffle_order={shuffle_order}, mix_ratios={mix_ratios}, "
+    f"shuffle_order={shuffle_order}, shuffle_special_policy={shuffle_special_policy}, "
+    f"compile={compile}, compile_parallel_tail={compile_parallel_tail}, "
+    f"compile_parallel_tail_dynamic={compile_parallel_tail_dynamic}, "
+    f"global_batch_target=512, mix_ratios={mix_ratios}, "
     f"regen_position_temperature={regen_position_temperature}, "
     f"online_regen_sample={online_regen_sample}, online_regen_method={online_regen_method}, "
     f"online_regen_temperature={online_regen_temperature}, online_regen_noise_std={online_regen_noise_std}"
@@ -488,6 +533,36 @@ if ddp:
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
     print(f"output directory: {out_dir}")
+    try:
+        git_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            text=True,
+        ).strip()
+        git_dirty = bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain"],
+                cwd=REPO_ROOT,
+                text=True,
+            ).strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        git_commit = "unavailable"
+        git_dirty = None
+    provenance = {
+        "command": os.environ.get(
+            "RUN_COMMAND_ORIGINAL",
+            " ".join([sys.executable, *sys.argv]),
+        ),
+        "git_commit": git_commit,
+        "git_dirty": git_dirty,
+        "cwd": str(REPO_ROOT),
+        "out_dir": out_dir,
+        "config": config,
+    }
+    with open(Path(out_dir) / "run_config_latest.txt", "w", encoding="utf-8") as f:
+        json.dump(provenance, f, indent=2, sort_keys=True, default=str)
+        f.write("\n")
 if ddp:
     torch.distributed.barrier()
 torch.manual_seed(1337 + seed_offset)
@@ -847,8 +922,12 @@ def get_batch(split):
             rows = torch.from_numpy(shuffle_idx)
             qi = z[rows, :quiz_size]
             pairs = z[rows, quiz_size:].reshape(n, response_size, 2)
-            # pure random (PAD-last is a decode/regen concept, never a train-shuffle bias)
-            perm = torch.rand(n, response_size, device=z.device).argsort(dim=1)
+            perm = build_torch_pair_permutation(
+                pairs[:, :, 1],
+                special_policy=shuffle_special_policy,
+                eos_id=eos_id,
+                pad_id=pad_id,
+            )
             pairs = pairs[torch.arange(n).unsqueeze(1), perm]
             z[rows] = torch.cat([qi, pairs.reshape(n, -1)], dim=1)
             if soft_index_targets is not None:
@@ -1021,11 +1100,19 @@ if init_from == 'resume' and checkpoint is not None and 'optimizer' in checkpoin
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+# Compile scoped forward methods, not the whole dispatcher. The T->0 tail has
+# multiple input lengths; static specialization is stable on PyTorch 2.0.
+if compile_parallel_tail and not compile_ddp_optimizer:
+    torch_dynamo.config.optimize_ddp = False
+if compile and serialized_ar_weight > 0:
+    print("compiling fixed-shape serialized-AR forward...")
+    model.enable_training_compile()
+if compile and parallel_tail_weight > 0 and compile_parallel_tail:
+    print(
+        "compiling shape-derived T->0 scorer "
+        f"(dynamic={compile_parallel_tail_dynamic})..."
+    )
+    model.enable_parallel_tail_compile(dynamic=compile_parallel_tail_dynamic)
 
 # wrap model into DDP container
 if ddp:
@@ -1037,7 +1124,7 @@ np.random.seed(seed + seed_offset)
 
 
 def run_forward_ar(model, idx, targets=None):
-    if isinstance(model, DDP) or compile:
+    if isinstance(model, DDP) or get_scoring_model(model)._compiled_forward_ar is not None:
         return model(idx, targets)
     return model.forward_ar(idx, targets)
 
@@ -1045,6 +1132,15 @@ def run_forward_ar(model, idx, targets=None):
 def get_scoring_model(model):
     base_model = model.module if isinstance(model, DDP) else model
     return getattr(base_model, "_orig_mod", base_model)
+
+
+def run_forward_parallel_tail(model, idx, num_tail):
+    if isinstance(model, DDP):
+        return model(idx, parallel_tail=True)
+    scoring_model = get_scoring_model(model)
+    if scoring_model._compiled_parallel_tail is not None:
+        return model(idx, parallel_tail=True)
+    return scoring_model.score_parallel_tail(idx, num_tail)
 
 
 def _soft_index_score_mode_internal():
@@ -1148,30 +1244,133 @@ def build_soft_index_targets(model, idx, targets):
     return torch.stack(soft_targets, dim=1)
 
 
+@torch.no_grad()
+def build_round1_uniform_soft_index_targets(model, idx, targets):
+    """Uniform next-index labels matching the round-1 shuffle policy."""
+    cfg = get_scoring_model(model).config
+    index_positions = _index_target_positions(idx.device)
+    pairs, gt_values = _gt_values_by_response_position(idx, targets, cfg)
+    valid_index_targets = targets[:, index_positions] != -100
+    used = torch.zeros(
+        idx.size(0),
+        cfg.response_size,
+        dtype=torch.bool,
+        device=idx.device,
+    )
+    soft_targets = []
+    for step in range(cfg.response_size):
+        eligible = build_torch_remaining_eligible_mask(
+            ~used,
+            gt_values,
+            special_policy=shuffle_special_policy,
+            eos_id=eos_id,
+            pad_id=pad_id,
+        )
+        dist = eligible.float()
+        dist = dist / dist.sum(dim=1, keepdim=True).clamp(min=1.0)
+        dist = dist * valid_index_targets[:, step].unsqueeze(1).float()
+        soft_targets.append(dist)
+        current_positions = pairs[:, step, 0] - cfg.index_token_start
+        used.scatter_(1, current_positions.long().unsqueeze(1), True)
+    return torch.stack(soft_targets, dim=1)
+
+
+def _prepare_soft_index_supervision(
+    model,
+    idx,
+    targets,
+    soft_index_targets=None,
+    *,
+    force_uniform=False,
+):
+    """Build soft labels while preserving value-only canonical mix rows."""
+    if force_uniform:
+        return build_round1_uniform_soft_index_targets(model, idx, targets)
+    if soft_index_targets is None:
+        return build_soft_index_targets(model, idx, targets)
+    return soft_index_targets
+
+
+def _parallel_tail_objective(model, idx, targets, soft_index_targets=None):
+    """Clean equivalent of the original serfox_Tto0 random-kk forward."""
+    cfg = get_scoring_model(model).config
+    pairs, _ = _gt_values_by_response_position(idx, targets, cfg)
+    batch = build_parallel_tail_batch(idx, pairs, cfg)
+    logits = run_forward_parallel_tail(model, batch.input_tokens, batch.num_tail)
+    dist = None
+    if soft_index_targets is not None:
+        dist = soft_index_targets[:, batch.step, :]
+    index_positions = _index_target_positions(targets.device)
+    index_supervision_mask = targets[:, index_positions[batch.step]] != -100
+    loss = parallel_tail_loss(
+        logits,
+        batch,
+        index_loss_mode=index_loss_mode,
+        index_token_start=cfg.index_token_start,
+        response_size=cfg.response_size,
+        soft_index_distribution=dist,
+        index_supervision_mask=index_supervision_mask,
+    )
+    return logits, loss
+
+
 def run_forward_train(model, idx, targets, soft_index_targets=None):
-    # round-1 (iter < round_interval) ALWAYS uses hard CE for the index: soft targets are
-    # only generated at round boundaries (round-2+), matching the note in get_batch. Without
-    # the `iter_num < round_interval` guard, soft + a non-uniform score (e.g. logit_margin)
-    # falls into per-step build_soft_index_targets (response_size forwards/step) and the
-    # training loop crawls to a near-hang. (uniform has a fast path so it never hit this.)
-    if index_loss_mode != "soft" or targets is None or iter_num < round_interval:
+    if targets is None:
         return run_forward_ar(model, idx, targets)
 
-    logits, _ = run_forward_ar(model, idx, None)
-    if soft_index_targets is None:
-        soft_index_targets = build_soft_index_targets(model, idx, targets)
-    index_positions = _index_target_positions(targets.device)
-    candidate_index_ids = (
-        torch.arange(response_size, device=targets.device, dtype=torch.long)
-        + value_vocab_size
+    use_round1_uniform = (
+        index_loss_mode == "soft"
+        and iter_num < round_interval
+        and round1_index_target == "uniform"
     )
-    loss = mixed_soft_index_ar_loss(
-        logits,
-        targets,
-        index_positions,
-        candidate_index_ids,
-        soft_index_targets,
-    )
+    prepared_soft_targets = soft_index_targets
+    if index_loss_mode == "soft" and (
+        use_round1_uniform or prepared_soft_targets is None
+    ):
+        prepared_soft_targets = _prepare_soft_index_supervision(
+            model,
+            idx,
+            targets,
+            prepared_soft_targets,
+            force_uniform=use_round1_uniform,
+        )
+
+    logits = None
+    loss = None
+    if serialized_ar_weight > 0:
+        if index_loss_mode == "soft" and not (
+            iter_num < round_interval and round1_index_target == "hard"
+        ):
+            logits, _ = run_forward_ar(model, idx, None)
+            index_positions = _index_target_positions(targets.device)
+            candidate_index_ids = (
+                torch.arange(response_size, device=targets.device, dtype=torch.long)
+                + value_vocab_size
+            )
+            loss = serialized_ar_weight * mixed_soft_index_ar_loss(
+                logits,
+                targets,
+                index_positions,
+                candidate_index_ids,
+                prepared_soft_targets,
+            )
+        else:
+            logits, serialized_loss = run_forward_ar(model, idx, targets)
+            loss = serialized_ar_weight * serialized_loss
+
+    if parallel_tail_weight > 0:
+        tail_logits, tail_loss = _parallel_tail_objective(
+            model,
+            idx,
+            targets,
+            prepared_soft_targets,
+        )
+        logits = tail_logits if logits is None else logits
+        tail_term = parallel_tail_weight * tail_loss
+        loss = tail_term if loss is None else loss + tail_term
+
+    if loss is None:
+        raise RuntimeError("No active training loss")
     return logits, loss
 
 

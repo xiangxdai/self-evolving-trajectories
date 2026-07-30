@@ -553,6 +553,8 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        self._compiled_forward_ar = None
+        self._compiled_parallel_tail = None
 
         # report number of parameters
         if config.use_rope:
@@ -763,6 +765,73 @@ class GPT(nn.Module):
         logits[..., self.config.index_token_start:] = float("-inf")
         return logits
 
+    def _score_parallel_tail_impl(self, idx, num_indices):
+        """Predict the next index and every remaining value from one T->0 prefix."""
+        _, t = idx.size()
+        prefix_len = t - num_indices
+        if prefix_len <= 0:
+            raise ValueError("parallel-tail scoring requires a non-empty causal prefix")
+
+        tok_emb = self.transformer.wte(idx)
+        if self.config.use_rope:
+            positions = torch.cat([
+                torch.arange(prefix_len, dtype=torch.long, device=idx.device),
+                torch.full(
+                    (num_indices,),
+                    prefix_len,
+                    dtype=torch.long,
+                    device=idx.device,
+                ),
+            ])
+            x = self._run_transformer(
+                tok_emb,
+                num_parallel_indices=num_indices,
+                positions=positions,
+            )
+        else:
+            pos = self._build_position_ids(idx)
+            prefix_pos_emb = self.transformer.wpe(pos[:, :prefix_len])
+            frontier_pos_emb = self.transformer.wpe(
+                pos[:, prefix_len:prefix_len + 1]
+            ).expand(-1, num_indices, -1)
+            x = self._run_transformer(
+                tok_emb + torch.cat([prefix_pos_emb, frontier_pos_emb], dim=1),
+                num_parallel_indices=num_indices,
+            )
+
+        # Prefix-final predicts the next index. Each parallel index token
+        # predicts its own ground-truth value.
+        return self.lm_head(x[:, prefix_len - 1:, :])
+
+    def score_parallel_tail_from_shape(self, idx):
+        """Score a T->0 tail with its length derived from the input shape."""
+        num_indices = (
+            self.config.quiz_size
+            + 2 * self.config.response_size
+            - idx.size(1)
+        )
+        return self._score_parallel_tail_impl(idx, num_indices)
+
+    def score_parallel_tail(self, idx, num_indices):
+        """Checked explicit-length entry point used by tests and eager callers."""
+        _, t = idx.size()
+        if num_indices <= 0:
+            raise ValueError(f"num_indices must be positive, got {num_indices}")
+        if num_indices >= t:
+            raise ValueError(
+                f"num_indices ({num_indices}) must leave a non-empty prefix in length {t}"
+            )
+        expected = (
+            self.config.quiz_size
+            + 2 * self.config.response_size
+            - t
+        )
+        if num_indices != expected:
+            raise ValueError(
+                f"num_indices={num_indices} disagrees with shape-derived length {expected}"
+            )
+        return self._score_parallel_tail_impl(idx, num_indices)
+
     def score_parallel_digit_groups(self, idx, num_groups, group_size):
         """Score grouped parallel candidates such as V5 fixed-length digits.
 
@@ -852,7 +921,30 @@ class GPT(nn.Module):
         logits[..., self.config.index_token_start:] = float("-inf")
         return logits
 
-    def forward(self, idx, targets=None):
+    def enable_training_compile(self, **compile_kwargs):
+        """Compile only the fixed-shape serialized-AR training forward."""
+        self._compiled_forward_ar = torch.compile(self.forward_ar, **compile_kwargs)
+
+    def enable_parallel_tail_compile(self, dynamic=False, **compile_kwargs):
+        """Compile the shape-derived T->0 scorer.
+
+        Static specialization is the safe default on PyTorch 2.0; it creates
+        one cached graph per encountered prefix length.
+        """
+        self._compiled_parallel_tail = torch.compile(
+            self.score_parallel_tail_from_shape,
+            dynamic=dynamic,
+            mode="default",
+            **compile_kwargs,
+        )
+
+    def forward(
+        self,
+        idx,
+        targets=None,
+        parallel_tail_count=None,
+        parallel_tail=False,
+    ):
         """
         Default PyTorch entry point.
 
@@ -863,6 +955,16 @@ class GPT(nn.Module):
         Ser-FOX's parallel index scorer is exposed explicitly through
         score_parallel_indices().
         """
+        if parallel_tail or parallel_tail_count is not None:
+            if targets is not None:
+                raise ValueError("parallel-tail scoring accepts targets=None only")
+            if parallel_tail_count is None:
+                if self._compiled_parallel_tail is not None:
+                    return self._compiled_parallel_tail(idx)
+                return self.score_parallel_tail_from_shape(idx)
+            return self.score_parallel_tail(idx, parallel_tail_count)
+        if self._compiled_forward_ar is not None:
+            return self._compiled_forward_ar(idx, targets)
         return self.forward_ar(idx, targets)
 
     def crop_block_size(self, block_size):

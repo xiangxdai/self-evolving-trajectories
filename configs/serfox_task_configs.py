@@ -35,7 +35,7 @@ class SerFoxTaskConfig:
     test_file: str
     train_batch_size: int = 256
     eval_batch_size: int = 256
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 2
     shuffle_order: bool = True
     first_round_l2r: bool = True
     mix_ratios: str = "1.0,0.0,0.0"
